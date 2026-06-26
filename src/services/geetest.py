@@ -411,83 +411,91 @@ class GeetestSolver:
 
     async def _detect_gap_pixel(self, screenshot_bytes: bytes) -> int | None:
         """Detect GeeTest gap position using OpenCV pixel analysis.
-        
+
         Takes a screenshot of the puzzle area and uses vertical edge detection
         combined with HSV value channel analysis to find the puzzle-shaped cutout (gap).
-        
+
+        Strategy:
+          1. Crop to puzzle area (top ~75%) — exclude slider track.
+          2. Sobel X edge detection → column-wise edge energy.
+          3. HSV V-channel → find dark regions (the gap is a shadowed cutout).
+          4. Filter: skip leftmost 15% (puzzle piece), skip regions <20px wide.
+          5. Score candidates by edge-peak strength + region width + center proximity.
+          6. Fallback: return start of widest valid region.
+
         Returns column position from window left edge, or None if detection fails.
         """
         if not screenshot_bytes or len(screenshot_bytes) < 1000:
-            log.info("Pixel gap detection: screenshot too small (%d bytes)", len(screenshot_bytes) if screenshot_bytes else 0)
+            log.info("Pixel gap detection: screenshot too small (%d bytes)",
+                     len(screenshot_bytes) if screenshot_bytes else 0)
             return None
-        
+
         try:
             import cv2
             import numpy as np
         except ImportError:
             log.info("Pixel gap detection: OpenCV import failed")
             return None
-        
+
         log.info("[PX] Starting pixel analysis for %d bytes", len(screenshot_bytes))
         try:
-            # Decode the image from bytes
             nparr = np.frombuffer(screenshot_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             if img is None:
                 log.info("Pixel gap detection: failed to decode image")
                 return None
-            
+
             h, w = img.shape[:2]
             log.info("[PX] Decoded: %dx%d, total pixels=%d", w, h, img.size)
             if h < 50 or w < 50:
                 log.info("Pixel gap detection: image too small (%dx%d)", w, h)
                 return None
-            
-            # Crop to just the puzzle area (top ~75% of combined image)
-            # The slider track is at the bottom ~25%
+
+            # ── 1. Crop to puzzle area (top ~75%) ──
             puzzle_h = int(h * 0.75)
             puzzle_img = img[:puzzle_h, :, :]
-            
+
             gray = cv2.cvtColor(puzzle_img, cv2.COLOR_BGR2GRAY)
-            log.info("[PX] Gray converted, shape=%s, dtype=%s, range=[%d,%d]", gray.shape, gray.dtype, gray.min(), gray.max())
-            
-            # ── Vertical edge detection (Sobel X) ──
+            log.info("[PX] Gray converted, shape=%s, dtype=%s, range=[%d,%d]",
+                     gray.shape, gray.dtype, gray.min(), gray.max())
+
+            # ── 2. Vertical edge detection ──
             sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
             abs_sobelx = np.absolute(sobelx)
             max_val = abs_sobelx.max()
             if max_val < 1:
                 return None
             sobelx_norm = np.uint8(abs_sobelx / max_val * 255)
-            
-            # Column-wise edge energy (skip header area)
+
+            # Column-wise edge energy (skip header band)
             top_skip = int(puzzle_h * 0.15)
             col_edges = np.sum(sobelx_norm[top_skip:], axis=0).astype(np.float64)
-            
-            # Smooth with moving average
+
+            # Smooth
             kernel = np.ones(5) / 5
             smoothed = np.convolve(col_edges, kernel, mode='same')
-            
-            # ── HSV Value channel analysis ──
+
+            # ── 3. HSV Value channel analysis ──
             hsv = cv2.cvtColor(puzzle_img, cv2.COLOR_BGR2HSV)
             v_channel = hsv[:, :, 2]
             col_v = np.mean(v_channel[top_skip:], axis=0).astype(np.float64)
             v_mean = np.mean(col_v)
             v_std = np.std(col_v)
-            
+
             if v_std < 2:
                 log.info("[PX] V std too low, skipping")
                 return None
-            
-            # Find dark regions (gap = shadow/cutout area)
-            dark_threshold = v_mean - 1.0 * v_std
+
+            dark_threshold = v_mean - 1.2 * v_std  # slightly stricter threshold
             dark_columns = np.where(col_v < dark_threshold)[0]
-            
-            log.info("[PX] Found %d dark columns, threshold=%.1f, v_mean=%.1f", len(dark_columns), dark_threshold, v_mean)
+
+            log.info("[PX] Found %d dark columns, threshold=%.1f, v_mean=%.1f, v_std=%.1f",
+                     len(dark_columns), dark_threshold, v_mean, v_std)
             if len(dark_columns) < 3:
                 log.info("Pixel gap detection: no dark regions found")
                 return None
-            
-            # Merge consecutive dark columns
+
+            # ── 4. Merge consecutive dark columns into regions ──
             regions = []
             start = dark_columns[0]
             for i in range(1, len(dark_columns)):
@@ -495,8 +503,8 @@ class GeetestSolver:
                     regions.append((int(start), int(dark_columns[i-1])))
                     start = dark_columns[i]
             regions.append((int(start), int(dark_columns[-1])))
-            
-            # Find edge peaks
+
+            # ── 5. Find edge peaks ──
             edge_threshold = float(np.mean(smoothed) + np.std(smoothed))
             peaks = []
             for i in range(5, w - 5):
@@ -504,31 +512,55 @@ class GeetestSolver:
                     window = smoothed[i-5:i+6]
                     if smoothed[i] == max(window):
                         peaks.append((i, float(smoothed[i])))
-            
             peaks.sort(key=lambda x: x[1], reverse=True)
-            
-            # Match edge peaks with dark region boundaries
-            for peak_col, _ in peaks:
+
+            # ── 6. Score candidates ──
+            # Exclude left 15% (puzzle piece area) and narrow regions (<20px)
+            min_col = int(w * 0.15)
+            min_region_width = 20
+
+            valid_candidates = []
+            for peak_col, peak_strength in peaks:
+                if peak_col < min_col:
+                    continue
                 for r_start, r_end in regions:
+                    region_width = r_end - r_start
+                    if region_width < min_region_width:
+                        continue
                     if abs(peak_col - r_start) <= 5:
-                        log.info(
-                            "Pixel gap detection: gap at column %d (region %d-%d, edge peak %d)",
-                            peak_col, r_start, r_end, peak_col,
-                        )
-                        return peak_col
-            
-            # Fallback: return start of widest dark region
-            if regions:
-                widest = max(regions, key=lambda r: r[1] - r[0])
+                        # Score: edge strength (0-1) + region_width bonus + center proximity
+                        center_dist = abs(peak_col - w / 2)
+                        center_score = 1.0 - (center_dist / (w / 2))  # 0..1, 1=at center
+                        width_bonus = min(1.0, region_width / 50)      # 0..1, 1=50px+
+                        score = (peak_strength / (peaks[0][1] if peaks else 1)) * 0.5 \
+                                + width_bonus * 0.3 + center_score * 0.2
+                        valid_candidates.append((score, peak_col, r_start, r_end, region_width))
+
+            if valid_candidates:
+                # Sort by score descending
+                valid_candidates.sort(key=lambda x: x[0], reverse=True)
+                score, peak_col, r_start, r_end, rw = valid_candidates[0]
                 log.info(
-                    "Pixel gap detection (fallback): gap at column %d (widest dark region)",
-                    widest[0],
+                    "Pixel gap detection: gap at column %d (region %d-%d, width=%d, score=%.2f)",
+                    peak_col, r_start, r_end, rw, score,
+                )
+                return peak_col
+
+            # ── 7. Fallback: widest region (excluding piece area) ──
+            filtered_regions = [(s, e) for s, e in regions
+                                if s >= min_col and (e - s) >= min_region_width]
+            if filtered_regions:
+                widest = max(filtered_regions, key=lambda r: r[1] - r[0])
+                log.info(
+                    "Pixel gap detection (fallback): gap at column %d (widest dark region, %d-%d)",
+                    widest[0], widest[0], widest[1],
                 )
                 return widest[0]
-            
-            log.info("[PX] No gap: peaks=%d, regions=%d, widest_region=%s", len(peaks), len(regions), str(max(regions, key=lambda r: r[1]-r[0]) if regions else 'none'))
+
+            log.info("[PX] No gap found: peaks=%d, regions=%d, filtered=%d, min_col=%d",
+                     len(peaks), len(regions), len(filtered_regions), min_col)
             return None
-            
+
         except Exception as e:
             log.info("Pixel gap detection error: %s", str(e)[:150])
             return None
