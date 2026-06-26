@@ -515,9 +515,9 @@ class GeetestSolver:
             peaks.sort(key=lambda x: x[1], reverse=True)
 
             # ── 6. Score candidates ──
-            # Exclude left 15% (puzzle piece area) and narrow regions (<20px)
-            min_col = int(w * 0.15)
-            min_region_width = 20
+            # Exclude leftmost region (puzzle piece area), skip narrow regions
+            min_col = int(w * 0.10)  # 10% — piece is usually within 8-12%
+            min_region_width = 10    # 10px — allow for low-contrast gaps
 
             valid_candidates = []
             for peak_col, peak_strength in peaks:
@@ -557,8 +557,34 @@ class GeetestSolver:
                 )
                 return widest[0]
 
-            log.info("[PX] No gap found: peaks=%d, regions=%d, filtered=%d, min_col=%d",
-                     len(peaks), len(regions), len(filtered_regions), min_col)
+            # ── 8. Relaxed threshold fallback ──
+            # If still no candidates, try with a more permissive threshold
+            relaxed_threshold = v_mean - 0.8 * v_std
+            dark_cols_relaxed = np.where(col_v < relaxed_threshold)[0]
+            if len(dark_cols_relaxed) >= 5:
+                # Rebuild regions
+                relaxed_regions = []
+                s = dark_cols_relaxed[0]
+                for i in range(1, len(dark_cols_relaxed)):
+                    if dark_cols_relaxed[i] - dark_cols_relaxed[i-1] > 5:
+                        relaxed_regions.append((int(s), int(dark_cols_relaxed[i-1])))
+                        s = dark_cols_relaxed[i]
+                relaxed_regions.append((int(s), int(dark_cols_relaxed[-1])))
+
+                # Find widest region right of piece area
+                valid_relaxed = [(s, e) for s, e in relaxed_regions
+                                 if s >= min_col and (e - s) >= min_region_width]
+                if valid_relaxed:
+                    widest_r = max(valid_relaxed, key=lambda r: r[1] - r[0])
+                    log.info(
+                        "Pixel gap detection (relaxed threshold=%.1f): gap at col %d "
+                        "(widest region %d-%d, width=%d)",
+                        relaxed_threshold, widest_r[0], widest_r[0], widest_r[1],
+                        widest_r[1] - widest_r[0],
+                    )
+                    return widest_r[0]
+
+            log.info("Pixel gap detection: no gap found")
             return None
 
         except Exception as e:
@@ -674,13 +700,15 @@ class GeetestSolver:
     ) -> None:
         """Drag the GeeTest slider button by the computed pixel offset.
 
+        Uses a cubic bezier curve with variable-speed micro-steps for
+        human-like movement that avoids server-side bot detection.
+
         Works in the challenge iframe if available, otherwise falls back
-        to the main page. Finds the slider handle element and performs
-        a human-like drag gesture.
+        to the main page.
         """
         target = challenge_frame if challenge_frame else page
 
-        # Locate the slider button
+        # ── 1. Locate the slider button ──
         slider_selectors = [
             ".geetest_slider_button",
             ".gt_slider_knob",
@@ -700,7 +728,7 @@ class GeetestSolver:
         if slider_handle is None:
             raise RuntimeError("Could not find GeeTest slider button")
 
-        # Get the slider dimensions and starting position
+        # ── 2. Get start / end positions ──
         box = await slider_handle.bounding_box()
         if box is None:
             raise RuntimeError("Could not get slider bounding box")
@@ -711,40 +739,97 @@ class GeetestSolver:
 
         log.info(
             "Dragging slider from (%.0f, %.0f) to (%.0f, %.0f) — %d px",
-            start_x,
-            start_y,
-            end_x,
-            start_y,
-            drag_pixels,
+            start_x, start_y, end_x, start_y, drag_pixels,
         )
 
-        # Perform a human-like drag with multiple steps
-        await page.mouse.move(start_x, start_y)
-        await asyncio.sleep(0.1)
+        # ── 3. Pre-drag hover ──
+        await page.mouse.move(
+            start_x + random_uniform(-3, 3),
+            start_y + random_uniform(-3, 3),
+        )
+        await asyncio.sleep(random_uniform(0.15, 0.35))
         await page.mouse.down()
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(random_uniform(0.04, 0.09))
 
-        # Smooth drag: move in small steps with slight jitter
-        steps = max(8, min(30, drag_pixels // 5))
-        step_size = drag_pixels / steps
-        for i in range(1, steps + 1):
-            progress = i / steps
-            # Add slight sine-wave jitter for human-like motion
-            import math
+        # ── 4. Bezier curve path ──
+        # Use a cubic bezier with two control points.
+        # Control points create: ease-in → accelerate → ease-out
+        import math
 
-            jitter = math.sin(progress * math.pi * 2) * 2
-            current_x = start_x + step_size * i + jitter
-            await page.mouse.move(
-                current_x,
-                start_y + random_uniform(-1, 1),
-            )
-            await asyncio.sleep(random_uniform(0.008, 0.025))
+        num_steps = max(12, min(40, drag_pixels // 3))
 
-        await asyncio.sleep(random_uniform(0.1, 0.2))
+        # Control points — tweaked for natural look
+        cp1_x = start_x + drag_pixels * random_uniform(0.15, 0.30)
+        cp1_y = start_y + random_uniform(-6, -2)
+        cp2_x = start_x + drag_pixels * random_uniform(0.65, 0.85)
+        cp2_y = start_y + random_uniform(2, 7)
+
+        # Variable speed: humans move faster in the middle, slower at ends
+        # Build a speed curve with acceleration + deceleration
+        speed_pattern = []
+        for i in range(num_steps):
+            t = i / (num_steps - 1)
+            # Bell-shaped speed: slow start, fast middle, slow end
+            speed = math.sin(t * math.pi)
+            # Add some randomness to each step
+            speed *= random_uniform(0.85, 1.15)
+            speed_pattern.append(speed)
+
+        # Normalise so sum of delays = total_time
+        total_time = random_uniform(0.35, 0.65)  # total drag time
+        inv_speeds = [1.0 / max(s, 0.01) for s in speed_pattern]
+        scale = total_time / sum(inv_speeds)
+        step_delays = [s * scale for s in inv_speeds]
+
+        # Previous position for velocity calculation
+        prev_x, prev_y = start_x, start_y
+
+        for i in range(num_steps):
+            t = (i + 1) / num_steps  # 0..1 progress
+
+            # Cubic bezier evaluation
+            mt = 1.0 - t
+            x = (mt**3) * start_x \
+                + 3 * (mt**2) * t * cp1_x \
+                + 3 * mt * (t**2) * cp2_x \
+                + (t**3) * end_x
+            y = (mt**3) * start_y \
+                + 3 * (mt**2) * t * cp1_y \
+                + 3 * mt * (t**2) * cp2_y \
+                + (t**3) * start_y
+
+            # Add natural wobble (small sine vertical oscillation)
+            wobble = math.sin(t * math.pi * 4) * random_uniform(0.5, 1.5)
+            y += wobble
+
+            # Add slight horizontal noise
+            x += random_uniform(-0.3, 0.3)
+
+            # Compute instantaneous velocity (px/step) for logging
+            dx = x - prev_x
+            dy = y - prev_y
+            vel = math.sqrt(dx**2 + dy**2)
+            prev_x, prev_y = x, y
+
+            await page.mouse.move(x, y)
+            await asyncio.sleep(step_delays[i])
+
+        # ── 5. Micro-correction at end (humans rarely stop exactly) ──
+        overshoot_x = end_x + random_uniform(-2, 2)
+        overshoot_y = start_y + random_uniform(-0.5, 0.5)
+        await page.mouse.move(overshoot_x, overshoot_y)
+        await asyncio.sleep(random_uniform(0.03, 0.08))
+
+        # Final settle on target
+        await page.mouse.move(end_x, start_y + random_uniform(-0.5, 0.5))
+        await asyncio.sleep(random_uniform(0.08, 0.18))
+
+        # ── 6. Release ──
         await page.mouse.up()
-        log.info("Slider drag complete")
+        log.info("Slider drag complete (%d px, %d steps, %.2fs)",
+                 drag_pixels, num_steps, total_time)
 
-        # Wait for GeeTest to validate the slide
+        # Wait for GeeTest server validation
         await asyncio.sleep(2)
 
     async def _extract_tokens(self, page: Any) -> dict[str, str]:
