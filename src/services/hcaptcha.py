@@ -1,4 +1,4 @@
-"""HCaptcha solver using Playwright browser automation.
+"""HCaptcha solver using Playwright browser automation (invisible_playwright).
 
 Supports HCaptchaTaskProxyless task type.
 Visits the target page, interacts with the hCaptcha widget, and extracts the response token.
@@ -10,21 +10,14 @@ import asyncio
 import logging
 from typing import Any
 
-from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import Browser
+from invisible_playwright.async_api import InvisiblePlaywright
 
 from ..core.config import Config
 
 log = logging.getLogger(__name__)
 
-_STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-window.chrome = {runtime: {}, loadTimes: () => {}, csi: () => {}};
-"""
-
-_EXTRACT_HCAPTCHA_TOKEN_JS = """
-() => {
+_EXTRACT_HCAPTCHA_TOKEN_JS = """() => {
     const textarea = document.querySelector('[name="h-captcha-response"]')
         || document.querySelector('[name="g-recaptcha-response"]');
     if (textarea && textarea.value && textarea.value.length > 20) {
@@ -40,35 +33,29 @@ _EXTRACT_HCAPTCHA_TOKEN_JS = """
 
 
 class HCaptchaSolver:
-    """Solves HCaptchaTaskProxyless tasks via headless Chromium."""
+    """Solves HCaptchaTaskProxyless tasks via invisible_playwright (patched Firefox)."""
 
-    def __init__(self, config: Config, browser: Browser | None = None) -> None:
+    def __init__(self, config: Config) -> None:
         self._config = config
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = browser
-        self._owns_browser = browser is None
+        self._ipw: InvisiblePlaywright | None = None
+        self._browser: Browser | None = None
 
     async def start(self) -> None:
         if self._browser is not None:
             return
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+        self._ipw = InvisiblePlaywright(
             headless=self._config.browser_headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            humanize=True,
+            profile_dir=None,  # persistent context WIP
         )
-        log.info("HCaptchaSolver browser started")
+        self._browser = await self._ipw.__aenter__()
+        log.info("HCaptchaSolver browser started (invisible_playwright Firefox)")
 
     async def stop(self) -> None:
-        if self._owns_browser:
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
+        if self._ipw:
+            await self._ipw.__aexit__(None, None, None)
+            self._ipw = None
+            self._browser = None
         log.info("HCaptchaSolver stopped")
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -99,16 +86,10 @@ class HCaptchaSolver:
         assert self._browser is not None
 
         context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
         page = await context.new_page()
-        await page.add_init_script(_STEALTH_JS)
 
         try:
             timeout_ms = self._config.browser_timeout * 1000

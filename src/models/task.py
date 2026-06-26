@@ -49,6 +49,10 @@ class SolutionObject(BaseModel):
     objects: list[int] | None = None
     answer: bool | list[int] | None = None
     userAgent: str | None = None
+    # GeeTest solution fields
+    challenge: str | None = None
+    geetest_validate: str | None = None
+    seccode: str | None = None
 
 
 class GetTaskResultResponse(BaseModel):

@@ -16,6 +16,7 @@ import logging
 import re
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 from PIL import Image
 
@@ -105,7 +106,17 @@ class ClassificationSolver:
         if not images:
             raise ValueError("No image data provided")
 
-        result = await self._classify(system_prompt, question, images)
+        # Download any URL-based images
+        resolved = []
+        for img in images:
+            if self._is_url(img) and not img.startswith("data:"):
+                log.info("Downloading URL image: %s...", img[:60])
+                b64_data = await self._download_image(img)
+                resolved.append(b64_data)
+            else:
+                resolved.append(img)
+
+        result = await self._classify(system_prompt, question, resolved)
         return result
 
     @staticmethod
@@ -119,8 +130,28 @@ class ClassificationSolver:
         return prompts.get(task_type, RECAPTCHA_V2_SYSTEM_PROMPT)
 
     @staticmethod
-    def _extract_images(params: dict[str, Any]) -> list[str]:
-        """Extract base64 image(s) from various param formats."""
+    def _is_url(s: str) -> bool:
+        """Check if a string looks like a URL (http/https/data)."""
+        return s.startswith(("http://", "https://", "data:"))
+
+    async def _download_image(self, url: str) -> str:
+        """Download an image from a URL and return base64 data URL."""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            content = resp.content
+            b64 = base64.b64encode(content).decode()
+            content_type = resp.headers.get("content-type", "image/png")
+            return f"data:{content_type};base64,{b64}"
+
+    def _extract_images(self, params: dict[str, Any]) -> list[str]:
+        """Extract base64 image(s) from various param formats.
+
+        Handles both raw base64 data and image URLs (which get downloaded).
+        """
         images: list[str] = []
 
         if "image" in params:
@@ -195,9 +226,34 @@ class ClassificationSolver:
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        cleaned = match.group(1) if match else text.strip()
-        data = json.loads(cleaned)
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected JSON object, got {type(data).__name__}")
-        return data
+        # Try to find JSON in code blocks first
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Try to find any JSON object in the text
+        match = re.search(r"\{[^{}]*\}", text)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                pass
+
+        # Try to find numbers in the response for simple classification
+        numbers = re.findall(r"\b(\d+)\b", text)
+        if numbers:
+            return {"objects": [int(n) for n in numbers]}
+
+        # Last resort: try to parse the whole text as JSON
+        cleaned = text.strip()
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        raise ValueError(f"Could not parse JSON from response: {text[:200]}")

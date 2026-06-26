@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from .api.routes import router
 from .core.config import config
 from .services.classification import ClassificationSolver
+from .services.geetest import GeetestSolver
 from .services.hcaptcha import HCaptchaSolver
 from .services.recognition import CaptchaRecognizer
 from .services.recaptcha_v2 import RecaptchaV2Solver
@@ -46,6 +47,10 @@ _HCAPTCHA_TYPES = [
 _TURNSTILE_TYPES = [
     "TurnstileTaskProxyless",
     "TurnstileTaskProxylessM1",
+]
+
+_GEETEST_TYPES = [
+    "GeeTestTaskProxyless",
 ]
 
 _CLASSIFICATION_TYPES = [
@@ -89,6 +94,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         task_manager.register_solver(task_type, turnstile_solver)
     log.info("Registered Turnstile solver for types: %s", _TURNSTILE_TYPES)
 
+    geetest_solver = GeetestSolver(config)
+    await geetest_solver.start()
+    for task_type in _GEETEST_TYPES:
+        task_manager.register_solver(task_type, geetest_solver)
+    log.info("Registered GeeTest solver for types: %s", _GEETEST_TYPES)
+
     recognizer = CaptchaRecognizer(config)
     for task_type in _IMAGE_TEXT_TYPES:
         task_manager.register_solver(task_type, recognizer)
@@ -105,6 +116,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await v2_solver.stop()
     await hcaptcha_solver.stop()
     await turnstile_solver.stop()
+    await geetest_solver.stop()
 
 
 app = FastAPI(

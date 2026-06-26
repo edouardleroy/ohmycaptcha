@@ -5,3 +5,4 @@ site/
 *.pyc
 cache/
 CLAUDE.md
+.env

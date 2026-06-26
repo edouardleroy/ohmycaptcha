@@ -35,6 +35,7 @@ _BROWSER_TASK_TYPES = {
     "HCaptchaTaskProxyless",
     "TurnstileTaskProxyless",
     "TurnstileTaskProxylessM1",
+    "GeeTestTaskProxyless",
 }
 
 _IMAGE_TASK_TYPES = {

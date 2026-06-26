@@ -1,4 +1,4 @@
-"""Cloudflare Turnstile solver using Playwright browser automation.
+"""Cloudflare Turnstile solver using Playwright browser automation (invisible_playwright).
 
 Supports TurnstileTaskProxyless and TurnstileTaskProxylessM1 task types.
 Visits the target page, interacts with the Turnstile widget, and extracts the token.
@@ -10,67 +10,38 @@ import asyncio
 import logging
 from typing import Any
 
-from playwright.async_api import Browser, Playwright, async_playwright
+from playwright.async_api import Browser
+from invisible_playwright.async_api import InvisiblePlaywright
 
 from ..core.config import Config
 
 log = logging.getLogger(__name__)
 
-_STEALTH_JS = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-window.chrome = {runtime: {}, loadTimes: () => {}, csi: () => {}};
-"""
-
-_EXTRACT_TURNSTILE_TOKEN_JS = """
-() => {
-    // Check for Turnstile response input
-    const input = document.querySelector('[name="cf-turnstile-response"]')
-        || document.querySelector('input[name*="turnstile"]');
-    if (input && input.value && input.value.length > 20) {
-        return input.value;
-    }
-    // Try the turnstile API
-    if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-        const resp = window.turnstile.getResponse();
-        if (resp && resp.length > 20) return resp;
-    }
-    return null;
-}
-"""
-
 
 class TurnstileSolver:
-    """Solves Cloudflare Turnstile tasks via headless Chromium."""
+    """Solves Cloudflare Turnstile tasks via invisible_playwright (patched Firefox)."""
 
-    def __init__(self, config: Config, browser: Browser | None = None) -> None:
+    def __init__(self, config: Config) -> None:
         self._config = config
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = browser
-        self._owns_browser = browser is None
+        self._ipw: InvisiblePlaywright | None = None
+        self._browser: Browser | None = None
 
     async def start(self) -> None:
         if self._browser is not None:
             return
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
+        self._ipw = InvisiblePlaywright(
             headless=self._config.browser_headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
+            humanize=True,
+            profile_dir=None,  # persistent context WIP
         )
-        log.info("TurnstileSolver browser started")
+        self._browser = await self._ipw.__aenter__()
+        log.info("TurnstileSolver browser started (invisible_playwright Firefox)")
 
     async def stop(self) -> None:
-        if self._owns_browser:
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
+        if self._ipw:
+            await self._ipw.__aexit__(None, None, None)
+            self._ipw = None
+            self._browser = None
         log.info("TurnstileSolver stopped")
 
     async def solve(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -101,16 +72,10 @@ class TurnstileSolver:
         assert self._browser is not None
 
         context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
         )
         page = await context.new_page()
-        await page.add_init_script(_STEALTH_JS)
 
         try:
             timeout_ms = self._config.browser_timeout * 1000
@@ -119,22 +84,27 @@ class TurnstileSolver:
             await page.mouse.move(400, 300)
             await asyncio.sleep(1)
 
-            # Try clicking the Turnstile checkbox
+            # Check if token is already present (auto-solve)
+            token = await self._get_token(page)
+            if token:
+                log.info("Got Turnstile token immediately (len=%d)", len(token))
+                return token
+
+            # Try clicking the Turnstile checkbox if visible
             try:
-                iframe_element = page.frame_locator(
+                cf_frame = page.frame_locator(
                     'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
                 )
-                checkbox = iframe_element.locator(
-                    'input[type="checkbox"], .ctp-checkbox-label, label'
-                )
+                checkbox = cf_frame.locator('[role="checkbox"], .ctp-checkbox-label, #checkbox')
                 await checkbox.click(timeout=8_000)
+                log.info("Clicked Turnstile checkbox")
             except Exception:
                 log.info("No Turnstile checkbox found, waiting for auto-solve")
 
-            # Wait for the token to appear
-            for _ in range(15):
-                await asyncio.sleep(2)
-                token = await page.evaluate(_EXTRACT_TURNSTILE_TOKEN_JS)
+            # Wait for token with retry
+            for _ in range(20):
+                await asyncio.sleep(3)
+                token = await self._get_token(page)
                 if token:
                     log.info("Got Turnstile token (len=%d)", len(token))
                     return token
@@ -142,3 +112,29 @@ class TurnstileSolver:
             raise RuntimeError("Turnstile token not obtained within timeout")
         finally:
             await context.close()
+
+    async def _get_token(self, page: Any) -> str | None:
+        """Extract Turnstile token using native locators (no CSP issues)."""
+        # Check cf-turnstile-response input (standard widget)
+        for selector in ['[name="cf-turnstile-response"]', 'input[name*="turnstile"]']:
+            try:
+                input_el = page.locator(selector).first
+                count = await input_el.count()
+                if count > 0:
+                    value = await input_el.input_value(timeout=1000)
+                    if value and len(value) > 20:
+                        return value
+            except Exception:
+                pass
+
+        # Try via turnstile API (may be blocked by CSP)
+        try:
+            api_value = await page.evaluate(
+                "window.turnstile?.getResponse?.() || null"
+            )
+            if isinstance(api_value, str) and len(api_value) > 20:
+                return api_value
+        except Exception:
+            pass
+
+        return None

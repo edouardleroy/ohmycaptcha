@@ -44,6 +44,7 @@ class Config:
     # Playwright browser
     browser_headless: bool
     browser_timeout: int  # seconds
+    browser_profile_dir: str | None  # persistent Firefox profile path
 
     # ── Convenience aliases (backward-compat) ──
 
@@ -100,6 +101,7 @@ def load_config() -> Config:
         browser_headless=os.environ.get("BROWSER_HEADLESS", "true").strip().lower()
         in {"1", "true", "yes"},
         browser_timeout=int(os.environ.get("BROWSER_TIMEOUT", "30")),
+        browser_profile_dir=os.environ.get("BROWSER_PROFILE_DIR", "").strip() or None,
     )
 
 

@@ -1,0 +1,33 @@
+# ── OhMyCaptcha .dockerignore ─────────────────────────────────
+# Exclude unnecessary files from the Docker build context.
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Environment / secrets
+.env
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+site/
+
+# PID file
+ohmycaptcha.pid
