@@ -206,15 +206,20 @@ class GeetestSolver:
             if not slide_screenshot:
                 raise RuntimeError("Failed to capture slide puzzle screenshot")
 
-            # ── Step 4: Determine slide offset using pixel analysis or vision ──
-            pixel_offset = await self._detect_gap_pixel(slide_screenshot)
-            if pixel_offset is not None:
-                drag_pixels = pixel_offset
-                log.info("Pixel analysis determined gap at column: %d px", drag_pixels)
+            # ── Step 4: Determine slide offset — try canvas comparison first ──
+            drag_pixels = await self._detect_gap_canvas(page, challenge_frame)
+            if drag_pixels is not None:
+                log.info("Canvas comparison determined gap at column: %d px", drag_pixels)
             else:
-                # Fallback: vision model
-                drag_pixels = await self._compute_slide_offset(slide_screenshot)
-                log.info("Vision model determined slide offset: %d px", drag_pixels)
+                # Fallback: pixel analysis on screenshot
+                pixel_offset = await self._detect_gap_pixel(slide_screenshot)
+                if pixel_offset is not None:
+                    drag_pixels = pixel_offset
+                    log.info("Pixel analysis determined gap at column: %d px", drag_pixels)
+                else:
+                    # Fallback: vision model
+                    drag_pixels = await self._compute_slide_offset(slide_screenshot)
+                    log.info("Vision model determined slide offset: %d px", drag_pixels)
             
             # ── Step 5: Adjust for handle starting position ──
             # The pixel/vision offset is from the LEFT EDGE of the puzzle window,
@@ -408,6 +413,87 @@ class GeetestSolver:
         shot = await page.screenshot(full_page=False, timeout=10000)
         log.info("Full-page screenshot (%d bytes)", len(shot))
         return shot
+
+    async def _detect_gap_canvas(
+        self, page: Any, challenge_frame: Any | None
+    ) -> int | None:
+        """Detect GeeTest gap by comparing bg vs fullbg canvas pixel data.
+
+        Extracts the background canvas (with cutout) and full background canvas
+        (without cutout) from GeeTest's slide puzzle, then finds where they differ
+        — this is the gap position. Returns None if canvas comparison fails
+        (e.g. on cross-origin iframes where getImageData is blocked).
+
+        Returns column position from window left edge, or None if detection fails.
+        """
+        frame = challenge_frame or page
+        try:
+            result = await frame.evaluate("""() => {
+                const bg = document.querySelector('.geetest_canvas_bg');
+                const full = document.querySelector('.geetest_canvas_fullbg');
+                if (!bg || !full) return null;
+                const bgCtx = bg.getContext('2d');
+                const fullCtx = full.getContext('2d');
+                if (!bgCtx || !fullCtx) return null;
+                const w = Math.min(bg.width, full.width);
+                const h = Math.min(bg.height, full.height);
+                const bgData = bgCtx.getImageData(0, 0, w, h).data;
+                const fullData = fullCtx.getImageData(0, 0, w, h).data;
+                // Compare each column across a sample of rows
+                const sampleRows = Math.min(h, 6);
+                const rowOffsets = [];
+                for (let i = 0; i < sampleRows; i++)
+                    rowOffsets.push(Math.floor(i * h / sampleRows));
+                const diffPerCol = [];
+                for (let x = 0; x < w; x++) {
+                    let totalDiff = 0;
+                    for (const r of rowOffsets) {
+                        const idx = (r * w + x) * 4;
+                        const d = Math.abs(bgData[idx] - fullData[idx])
+                               + Math.abs(bgData[idx+1] - fullData[idx+1])
+                               + Math.abs(bgData[idx+2] - fullData[idx+2]);
+                        totalDiff += d;
+                    }
+                    diffPerCol.push(totalDiff);
+                }
+                // Find the leftmost column where diff exceeds threshold
+                const mean = diffPerCol.reduce((a,b) => a+b, 0) / diffPerCol.length;
+                const std = Math.sqrt(diffPerCol.reduce((s, v) => s + (v-mean)**2, 0) / diffPerCol.length);
+                const threshold = Math.max(50, mean + std * 1.5);
+                // Find columns above threshold
+                const above = [];
+                for (let x = 0; x < w; x++) {
+                    if (diffPerCol[x] > threshold) above.push(x);
+                }
+                if (above.length < 5) return null;
+                // Merge consecutive columns (allow gaps up to 3)
+                const mergedRuns = [];
+                let runStart = above[0], prev = above[0], count = 1;
+                for (let i = 1; i < above.length; i++) {
+                    if (above[i] - prev <= 4) {
+                        count++;
+                        prev = above[i];
+                    } else {
+                        mergedRuns.push({start: runStart, end: prev, width: prev - runStart + 1});
+                        runStart = above[i];
+                        prev = above[i];
+                        count = 1;
+                    }
+                }
+                mergedRuns.push({start: runStart, end: prev, width: prev - runStart + 1});
+                // Return the start of the widest run
+                let best = null;
+                for (const run of mergedRuns) {
+                    if (run.width >= 20 && (!best || run.width > best.width)) best = run;
+                }
+                return best ? best.start : null;
+            }""")
+            if result is not None and isinstance(result, (int, float)) and result > 0:
+                log.info("[CANVAS] Gap at column %d (bg vs fullbg comparison)", result)
+                return int(result)
+        except Exception as e:
+            log.info("[CANVAS] Canvas comparison failed: %s", str(e)[:80])
+        return None
 
     async def _detect_gap_pixel(self, screenshot_bytes: bytes) -> int | None:
         """Detect GeeTest gap position using OpenCV pixel analysis.
