@@ -1,31 +1,10 @@
 # ──────────────────────────────────────────────────────────────────
 # OhMyCaptcha — docker-compose.yml
-# Runs the captcha solver (port 8000) alongside Ollama (port 11434)
-# for vision model inference (llava:7b, qwen2.5vl:7b).
+# Runs the captcha solver on port 8000. Connects to host's Ollama
+# (already running on port 11434) via host.docker.internal.
 # ──────────────────────────────────────────────────────────────────
 
 services:
-  # ── Ollama — self-hosted LLM inference for vision models ──
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_models:/root/.ollama
-    environment:
-      # Keep the model loaded in memory for faster inference
-      - OLLAMA_KEEP_ALIVE=24h
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:11434/api/tags"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 40s
-    networks:
-      - ohmycaptcha-net
-
   # ── OhMyCaptcha — captcha solving service ─────────────────
   ohmycaptcha:
     build:
@@ -35,18 +14,17 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
-    depends_on:
-      ollama:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # Server
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
 
-      # Local model — points to the Ollama service in the compose network
-      - LOCAL_BASE_URL=http://ollama:11434/v1
+      # Local model — uses host's Ollama (already running)
+      - LOCAL_BASE_URL=http://host.docker.internal:11434/v1
       - LOCAL_API_KEY=EMPTY
-      - LOCAL_MODEL=llava:7b
+      - LOCAL_MODEL=qwen2.5vl:7b
 
       # Cloud model — replace with your actual endpoint if using a remote API
       - CLOUD_BASE_URL=https://your-openai-compatible-endpoint/v1
@@ -66,26 +44,14 @@ services:
       - CLIENT_KEY=
     volumes:
       - firefox_profile:/app/firefox-profile
-      # Mount .env from host if you prefer file-based config:
-      # - ./.env:/app/.env:ro
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8000/api/v1/health"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 30s
-    networks:
-      - ohmycaptcha-net
 
 volumes:
-  ollama_models:
-    driver: local
-    name: ohmycaptcha_ollama_models
   firefox_profile:
     driver: local
     name: ohmycaptcha_firefox_profile
-
-networks:
-  ohmycaptcha-net:
-    driver: bridge
-    name: ohmycaptcha_network
