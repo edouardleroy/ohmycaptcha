@@ -206,16 +206,20 @@ class GeetestSolver:
             if not slide_screenshot:
                 raise RuntimeError("Failed to capture slide puzzle screenshot")
 
-            # ── Step 4: Vision model determines the slide offset ──
-            drag_pixels = await self._compute_slide_offset(slide_screenshot)
-            log.info("Vision model determined slide offset: %d px", drag_pixels)
-
-            # ── Step 5: Adjust offset from handle position ──
-            # The vision model reports offset from the LEFT EDGE of the puzzle window.
-            # But the slider handle starts at some position WITHIN that window.
-            # We need to subtract the handle's starting offset from the vision result.
-            adjusted_offset = drag_pixels
+            # ── Step 4: Determine slide offset using pixel analysis or vision ──
+            pixel_offset = await self._detect_gap_pixel(slide_screenshot)
+            if pixel_offset is not None:
+                drag_pixels = pixel_offset
+                log.info("Pixel analysis determined gap at column: %d px", drag_pixels)
+            else:
+                # Fallback: vision model
+                drag_pixels = await self._compute_slide_offset(slide_screenshot)
+                log.info("Vision model determined slide offset: %d px", drag_pixels)
             
+            # ── Step 5: Adjust for handle starting position ──
+            # The pixel/vision offset is from the LEFT EDGE of the puzzle window,
+            # but the handle starts at ~27px from the left edge.
+            adjusted_offset = drag_pixels
             try:
                 win = page.locator(".geetest_window").first
                 handle = page.locator(".geetest_slider_button").first
@@ -227,18 +231,17 @@ class GeetestSolver:
                         handle_offset = handle_center - win_box["x"]
                         adjusted_offset = max(0, min(300, drag_pixels - int(handle_offset)))
                         log.info(
-                            "Adjusted offset: vision=%d, handle_offset=%.0f, adjusted=%d",
+                            "Adjusted: gap_at=%d, handle_offset=%.0f, drag=%d",
                             drag_pixels, handle_offset, adjusted_offset,
                         )
-            except Exception as e:
-                log.debug("Offset adjustment failed: %s", str(e)[:60])
+            except Exception:
                 adjusted_offset = drag_pixels
-
+            
             log.info("Final drag offset: %d px", adjusted_offset)
 
             # ── Step 6: Drag the slider with nudge loop ──
             # Try the primary offset first, then nudge ±3, ±5, ±8 if needed
-            nudge_offsets = [0, 3, -3, 5, -5, 10, -10, 15, -15, 20, -20, 30, -30, 40, -40, 50, -50, -60, 70, -70, 80, -80, 100, -100]
+            nudge_offsets = [0, 1, -1, 3, -3, 5, -5, 10, -10, 15, -15, 20, -20, 30, -30, 40, -40, 50, -50, 60, -60, 70, -70, 80, -80, 100, -100]
             drag_pixels_base = adjusted_offset
             for nudge in nudge_offsets:
                 offset = max(0, min(300, drag_pixels_base + nudge))
@@ -399,12 +402,137 @@ class GeetestSolver:
                     log.info("Combined puzzle+slider clip: %s (%d bytes)", clip, len(shot))
                     return shot
         except Exception as e:
-            log.debug("Combined clip failed: %s", str(e)[:60])
+            log.info("Combined clip failed: %s", str(e)[:60])
         
         # Fallback: full-page screenshot
         shot = await page.screenshot(full_page=False, timeout=10000)
         log.info("Full-page screenshot (%d bytes)", len(shot))
         return shot
+
+    async def _detect_gap_pixel(self, screenshot_bytes: bytes) -> int | None:
+        """Detect GeeTest gap position using OpenCV pixel analysis.
+        
+        Takes a screenshot of the puzzle area and uses vertical edge detection
+        combined with HSV value channel analysis to find the puzzle-shaped cutout (gap).
+        
+        Returns column position from window left edge, or None if detection fails.
+        """
+        if not screenshot_bytes or len(screenshot_bytes) < 1000:
+            log.info("Pixel gap detection: screenshot too small (%d bytes)", len(screenshot_bytes) if screenshot_bytes else 0)
+            return None
+        
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            log.info("Pixel gap detection: OpenCV import failed")
+            return None
+        
+        log.info("[PX] Starting pixel analysis for %d bytes", len(screenshot_bytes))
+        try:
+            # Decode the image from bytes
+            nparr = np.frombuffer(screenshot_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                log.info("Pixel gap detection: failed to decode image")
+                return None
+            
+            h, w = img.shape[:2]
+            log.info("[PX] Decoded: %dx%d, total pixels=%d", w, h, img.size)
+            if h < 50 or w < 50:
+                log.info("Pixel gap detection: image too small (%dx%d)", w, h)
+                return None
+            
+            # Crop to just the puzzle area (top ~75% of combined image)
+            # The slider track is at the bottom ~25%
+            puzzle_h = int(h * 0.75)
+            puzzle_img = img[:puzzle_h, :, :]
+            
+            gray = cv2.cvtColor(puzzle_img, cv2.COLOR_BGR2GRAY)
+            log.info("[PX] Gray converted, shape=%s, dtype=%s, range=[%d,%d]", gray.shape, gray.dtype, gray.min(), gray.max())
+            
+            # ── Vertical edge detection (Sobel X) ──
+            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            abs_sobelx = np.absolute(sobelx)
+            max_val = abs_sobelx.max()
+            if max_val < 1:
+                return None
+            sobelx_norm = np.uint8(abs_sobelx / max_val * 255)
+            
+            # Column-wise edge energy (skip header area)
+            top_skip = int(puzzle_h * 0.15)
+            col_edges = np.sum(sobelx_norm[top_skip:], axis=0).astype(np.float64)
+            
+            # Smooth with moving average
+            kernel = np.ones(5) / 5
+            smoothed = np.convolve(col_edges, kernel, mode='same')
+            
+            # ── HSV Value channel analysis ──
+            hsv = cv2.cvtColor(puzzle_img, cv2.COLOR_BGR2HSV)
+            v_channel = hsv[:, :, 2]
+            col_v = np.mean(v_channel[top_skip:], axis=0).astype(np.float64)
+            v_mean = np.mean(col_v)
+            v_std = np.std(col_v)
+            
+            if v_std < 2:
+                log.info("[PX] V std too low, skipping")
+                return None
+            
+            # Find dark regions (gap = shadow/cutout area)
+            dark_threshold = v_mean - 1.0 * v_std
+            dark_columns = np.where(col_v < dark_threshold)[0]
+            
+            log.info("[PX] Found %d dark columns, threshold=%.1f, v_mean=%.1f", len(dark_columns), dark_threshold, v_mean)
+            if len(dark_columns) < 3:
+                log.info("Pixel gap detection: no dark regions found")
+                return None
+            
+            # Merge consecutive dark columns
+            regions = []
+            start = dark_columns[0]
+            for i in range(1, len(dark_columns)):
+                if dark_columns[i] - dark_columns[i-1] > 3:
+                    regions.append((int(start), int(dark_columns[i-1])))
+                    start = dark_columns[i]
+            regions.append((int(start), int(dark_columns[-1])))
+            
+            # Find edge peaks
+            edge_threshold = float(np.mean(smoothed) + np.std(smoothed))
+            peaks = []
+            for i in range(5, w - 5):
+                if smoothed[i] > edge_threshold:
+                    window = smoothed[i-5:i+6]
+                    if smoothed[i] == max(window):
+                        peaks.append((i, float(smoothed[i])))
+            
+            peaks.sort(key=lambda x: x[1], reverse=True)
+            
+            # Match edge peaks with dark region boundaries
+            for peak_col, _ in peaks:
+                for r_start, r_end in regions:
+                    if abs(peak_col - r_start) <= 5:
+                        log.info(
+                            "Pixel gap detection: gap at column %d (region %d-%d, edge peak %d)",
+                            peak_col, r_start, r_end, peak_col,
+                        )
+                        return peak_col
+            
+            # Fallback: return start of widest dark region
+            if regions:
+                widest = max(regions, key=lambda r: r[1] - r[0])
+                log.info(
+                    "Pixel gap detection (fallback): gap at column %d (widest dark region)",
+                    widest[0],
+                )
+                return widest[0]
+            
+            log.info("[PX] No gap: peaks=%d, regions=%d, widest_region=%s", len(peaks), len(regions), str(max(regions, key=lambda r: r[1]-r[0]) if regions else 'none'))
+            return None
+            
+        except Exception as e:
+            log.info("Pixel gap detection error: %s", str(e)[:150])
+            return None
+
 
     async def _compute_slide_offset(self, screenshot_bytes: bytes) -> int:
         """Use the vision model (llava) to determine the slide offset in pixels.
